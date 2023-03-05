@@ -1,0 +1,10 @@
+# Ignore Everything
+*
+
+# Except these files
+!make.sh
+!.gitignore
+
+# Except these folders
+!overlay
+!overlay/**

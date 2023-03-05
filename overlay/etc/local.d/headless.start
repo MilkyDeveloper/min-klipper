@@ -1,0 +1,108 @@
+#!/bin/sh
+
+# Some code adapted from:
+# https://github.com/macmpi/alpine-linux-headless-bootstrap/blob/main/overlay/etc/local.d/headless.start
+
+# Location of the extracted overlay
+OVERLAY=$( find /media -type d -path '*/.*' -prune -o -type f -name '*.apkovl.tar.gz' -exec dirname {} \; | head -1 )
+
+# Import configuration file
+# shellcheck disable=SC1091
+. "$OVERLAY/overlay.config"
+
+# Setup Network interfaces
+if [ "$METHOD" = "wifi" ]; then
+	apk add wpa_supplicant
+	cat <<-EOF >> /etc/wpa_supplicant/wpa_supplicant.conf
+	country=$COUNTRY
+
+	network={
+		key_mgmt=WPA-PSK
+		ssid="$SSID"
+		psk="$PSK"
+	}
+	EOF
+fi
+
+# Populate network interfaces
+for DEV in /sys/class/net/*
+do
+	case ${DEV%%[0-9]*} in
+		lo)
+				cat <<-EOF >> /etc/network/interfaces
+				auto $DEV
+				iface $DEV inet loopback
+
+				EOF
+				;;
+		eth)
+				cat <<-EOF >> /etc/network/interfaces
+				auto $DEV
+				iface $DEV inet dhcp
+
+				EOF
+				;;
+		wlan)
+				# Don't unnecessarily add a wifi interface
+				[ "$METHOD" = "wifi" ] && cat <<-EOF >> /etc/network/interfaces
+				auto $DEV
+				iface $DEV inet dhcp
+
+				EOF
+				;;
+		usb)
+				# Retained from the original repo
+				# I'm not exactly sure how this works
+				cat <<-EOF >> /etc/network/interfaces
+				auto $DEV
+				iface $DEV inet static
+					address 10.42.0.2/24
+					gateway 10.42.0.1
+
+				EOF
+
+				cat <<-EOF > /etc/resolv.conf
+				nameserver 1.1.1.1
+				nameserver 1.0.0.1
+				EOF
+				;;
+	esac
+done
+
+# Update hostname
+echo "$NEW_HOSTNAME" > /etc/hostname
+# Set hostname
+hostname -F /etc/hostname
+
+# Intialize network services
+[ "$METHOD" = "wifi" ] && rc-service wpa_supplicant start
+rc-service networking start
+
+# Setup temporary SSH server (root logins, no password)
+# we use some bundled keys to avoid generation at boot and save time
+# bundled temporary keys are moved in /tmp so they won't be stored
+# within permanent config later (new ones will then be generated)
+apk add openssh
+
+# Generate RSA key
+rm /etc/ssh/*key
+rm /etc/ssh/*key.pub
+ssh-keygen -A -N "$PASSPHRASE"
+
+# Allow empty passwords for the root login
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.old
+cat <<-EOF >> /etc/ssh/sshd_config
+	AuthenticationMethods none
+	PermitEmptyPasswords yes
+	PermitRootLogin yes
+	HostKey /etc/ssh/ssh_host_ed25519_key
+	HostKey /etc/ssh/ssh_host_rsa_key
+	EOF
+
+# Disable key generation
+cp /etc/conf.d/sshd /etc/conf.d/sshd.old
+cat <<-EOF >> /etc/conf.d/sshd
+	sshd_disable_keygen=yes
+	EOF
+
+rc-service sshd start
