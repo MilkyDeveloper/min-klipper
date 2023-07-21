@@ -1,0 +1,172 @@
+#!/bin/bash
+
+# Also see:
+# https://github.com/knoopx/alpine-klipper/blob/master/install.sh
+# https://github.com/Klipper3d/klipper/blob/master/scripts/install-arch.sh
+
+# TODO: follow unix standards for file locations instead of using $HOME
+
+set -ex
+
+INSTALL_DIR="/root" # Where all of the below will be installed
+
+KLIPPER_DIR="$INSTALL_DIR/klipper" # Location of Klipper's source code
+KLIPPY_ENV="$INSTALL_DIR/klippy-env" # Location of Klipper's Python virtual environment
+MOONRAKER_DIR="$INSTALL_DIR/moonraker" # Location of Moonraker's source code
+FLUIDD_DIR="$INSTALL_DIR/www" # Location of Fluidd's built files
+DATA_DIR="$INSTALL_DIR/printer_data" # Where all Klipper data goes
+
+# For use by other scripts
+cat << EOF > "$INSTALL_DIR"/minklipper.env
+KLIPPER_DIR="$KLIPPER_DIR"
+KLIPPY_ENV="$KLIPPY_ENV"
+MOONRAKER_DIR="$MOONRAKER_DIR"
+FLUIDD_DIR="$FLUIDD_DIR"
+DATA_DIR="$DATA_DIR"
+EOF
+
+# Install necessary packages
+apk update
+apk add py3-virtualenv libffi-dev build-base ncurses-libs libusb-dev avrdude gcc-avr binutils-avr avr-libc stm32flash newlib-arm-none-eabi newlib-arm-none-eabi gcc-arm-none-eabi libusb git python3-dev libsodium curl-dev jpeg-dev iproute2 newt eudev
+
+# Scaffold basic directories
+mkdir -p "$DATA_DIR"/{config,logs,models,plugins,scripts,settings,system}
+
+# Clone Klipper
+git clone --depth 1 https://github.com/Klipper3d/klipper "$KLIPPER_DIR"
+
+# Create Klipper's Python virtual environment
+virtualenv -p python3 "$KLIPPY_ENV"
+
+# Install dependencies in the virtual environment
+"$KLIPPY_ENV"/bin/python -m pip install --upgrade pip
+"$KLIPPY_ENV"/bin/pip install -r "$KLIPPER_DIR"/scripts/klippy-requirements.txt
+
+# Create a service that forces /dev/serial/by-id to be populated
+tee /etc/init.d/klipper-udev <<EOF
+#!/sbin/openrc-run
+command="/sbin/udevadm"
+command_args="trigger --action=add --subsystem-match=tty"
+command_background=true
+command_user=root
+pidfile="/run/klipper-udev.pid"
+EOF
+
+# Create an openrc service for Klipper
+tee /etc/init.d/klipper <<EOF
+#!/sbin/openrc-run
+command="$KLIPPY_ENV/bin/python"
+command_args="$KLIPPER_DIR/klippy/klippy.py $DATA_DIR/config/printer.cfg -l $DATA_DIR/logs/klippy.log -a /tmp/klippy_uds"
+command_background=true
+command_user=root
+pidfile="/run/klipper.pid"
+EOF
+
+# Register the Klipper and udev service
+chmod +x /etc/init.d/{klipper,klipper-udev}
+rc-update add {klipper,klipper-udev}
+
+# Clone Moonraker
+git clone https://github.com/Arksine/moonraker "$MOONRAKER_DIR"
+
+# Install dependencies for Moonraker in the Klipper virtual environment
+# We use the same virtual environment for simplicity
+"$KLIPPY_ENV"/bin/pip install -r "$MOONRAKER_DIR"/scripts/moonraker-requirements.txt
+
+# Create a Moonraker configuration file
+# Necessary for Moonraker to connect to Fluidd
+cat > "$DATA_DIR"/config/moonraker.conf <<EOF
+# The machine section is needed for our custom setup,
+# since Klipper goes into read-only mode if it can't find the service file.
+# This bypasses that (validate_service) and also removes a dbus warning (provider).
+[machine]
+provider: none
+validate_service: false
+
+[server]
+host: 0.0.0.0
+port: 7125
+
+[file_manager]
+# cancel object preprocessing - set to True to enable; leave disabled when running on a low-powered device (e.g. Pi Zero)
+enable_object_processing: False
+
+[data_store]
+temperature_store_size: 600
+gcode_store_size: 1000
+
+[authorization]
+force_logins: false
+
+cors_domains:
+  *.local
+  *.lan
+  *://app.fluidd.xyz
+
+trusted_clients:
+  10.0.0.0/8
+  127.0.0.0/8
+  169.254.0.0/16
+  172.16.0.0/12
+  192.168.0.0/16
+  FE80::/10
+  ::1/128
+  192.168.1.0/24
+
+[history]
+
+[octoprint_compat]
+
+[update_manager]
+enable_auto_refresh: True
+
+[announcements]
+subscriptions:
+  fluidd
+
+[update_manager fluidd]
+type: web
+repo: fluidd-core/fluidd
+path: $FLUIDD_DIR
+EOF
+
+# Create an openrc service for Moonraker
+tee /etc/init.d/moonraker <<EOF
+#!/sbin/openrc-run
+command="$KLIPPY_ENV/bin/python"
+command_args="$MOONRAKER_DIR/moonraker/moonraker.py -d $DATA_DIR"
+command_background=true
+command_user=root
+pidfile="/run/moonraker.pid"
+depend() {
+  before klipper
+}
+EOF
+
+# Register the Moonraker service
+chmod +x /etc/init.d/moonraker
+rc-update add moonraker
+
+# Download Fluidd
+wget https://github.com/fluidd-core/fluidd/releases/latest/download/fluidd.zip -O /tmp/fluidd.zip
+unzip /tmp/fluidd.zip -d "$FLUIDD_DIR"
+
+# Download the Fluidd client.cfg (required macros/features)
+wget https://raw.githubusercontent.com/fluidd-core/fluidd-config/master/client.cfg -O "$DATA_DIR"/config/client.cfg
+
+# Create an openrc service for Fluidd
+tee /etc/init.d/fluidd <<EOF
+#!/sbin/openrc-run
+command="/usr/bin/python"
+command_args="-m http.server -d $FLUIDD_DIR"
+command_background=true
+command_user=root
+pidfile="/run/fluidd.pid"
+depend() {
+  after moonraker
+}
+EOF
+
+# Register the Moonraker service
+chmod +x /etc/init.d/fluidd
+rc-update add fluidd

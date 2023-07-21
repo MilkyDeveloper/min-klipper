@@ -2,9 +2,17 @@
 *
 
 # Except these files
-!make.sh
+!make*.sh
+!build.sh
+!chrootstrap.sh
+!overlay.config
 !.gitignore
 
 # Except these folders
 !overlay
 !overlay/**
+!scripts
+!scripts/**
+!init
+!init/**
+init/result.cfg

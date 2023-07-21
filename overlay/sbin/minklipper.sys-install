@@ -1,0 +1,176 @@
+#!/bin/bash
+# shellcheck disable=SC2145,SC2128
+
+#set -e - We don't need this since we use catch, which exits by itself
+#set +o pipefail - Already the default
+set -ex
+
+# trap 'catch $? $LINENO' ERR
+
+# catch() {
+# 	echo "{ \"type\": \"error\", \"error\": \"$1\", \"line\": \"$2\" }"
+# }
+
+# # Receives data through stdin so you don't have to do debug $(command)
+# debug() {
+# 	# Does not work, see my issue:
+# 	# https://unix.stackexchange.com/q/743955/528987
+# 	# if [[ ! "$PIPESTATUS" -eq 0 ]]; then
+# 	# 	echo "{ \"type\": \"debug\", \"error\": \"$PIPESTATUS\", \"content\": \"$(cat | awk '{printf "%s\\n", $0}')\", \"id\": \"$@\" }"
+# 	# 	exit
+# 	# fi
+# 	echo "{ \"type\": \"debug\", \"content\": \"$(cat | awk '{printf "%s\\n", $0}')\", \"id\": \"$@\" }"
+# 	logger -st "${0##*/}" "$@"
+# }
+
+apk update
+apk add ncurses parted lsblk ca-certificates bash nano raspberrypi-bootloader
+
+# It's really difficult to find out the root partition in Alpine since it uses tmpfs for the root
+# We use the label MINKLIPPER to find the root partition
+ROOT_RAW="/dev/$(lsblk -o name,label -n -i -r | grep MINKLIPPER | awk '{print $1}')"
+
+# Needed for copying the overlay
+OVERLAY=$( find /media -type d -path '*/.*' -prune -o -type f -name '*.apkovl.tar.gz' -exec dirname {} \; | head -1 )
+
+# Trim last or last two characters
+case $ROOT_RAW in
+        *mmcblk*)
+                # Remove two character if it's like /dev/mmcblk0p2
+                ROOT="$(echo "$ROOT_RAW" | rev | cut -c 3- | rev)"
+        ;;
+
+        *)
+                # Remove one character if it's like /dev/sda2
+                ROOT="$(echo "$ROOT_RAW" | rev | cut -c 2- | rev)2"
+        ;;
+esac
+
+# Agnostic for (e.x.) mmcblk0p2 or sda2
+ROOT_FS="$(echo "$ROOT_RAW" | rev | cut -c 2- | rev)2"
+
+# Used for finding the media mount
+ROOT_KERNEL_SHORT=$(echo "$ROOT_RAW" | sed 's/\/dev\///')
+
+# Used for the kernel parameters
+# ROOT_FS_SHORT=$(echo "$ROOT_FS" | sed 's/\/dev\///')
+
+# Log the root partitions
+#echo "{ \"root\": \"$ROOT\", \"root_fs\": \"$ROOT_FS\", \"root_kernel_short\": \"$ROOT_KERNEL_SHORT\", \"root_fs_short\": \"$ROOT_FS_SHORT\""
+
+# Resize the root partition to occupy all of the remaining space
+parted -s "$ROOT" resizepart 2 100%
+
+# We're using setup-disk instead of setup-alpine so we don't need the below
+
+# Answers file for headless setup-alpine
+# cat <<- EOF > /tmp/answers
+# KEYMAPOPTS="us us" # Use US layout with US variant
+# HOSTNAMEOPTS=minklipper
+# DEVDOPTS=mdev
+# INTERFACESOPTS="$(cat /etc/network/interfaces)"
+# TIMEZONEOPTS=none
+# PROXYOPTS=none
+# APKREPOSOPTS="-1"
+# USEROPTS="-a -u -g audio,video,netdev minklipper"
+# SSHDOPTS=openssh
+# #ROOTSSHKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOIiHcbg/7ytfLFHUNLRgEAubFz/13SwXBOM/05GNZe4 juser@example.com"
+# #ROOTSSHKEY="https://example.com/juser.keys"
+# NTPOPTS=none
+# DISKOPTS="-m data /mnt"
+# LBUOPTS=none
+# APKCACHEOPTS=none
+# EOF
+
+# Mount $ROOT_FS to /mnt
+umount /mnt || true
+mount "$ROOT_FS" /mnt || ( error "Failed to mount $ROOT_FS to /mnt, exiting" && exit 1 )
+
+# Run setup-disk
+# Actually installs Alpine
+export FORCE_BOOTFS=1
+setup-disk -m sys /mnt
+cp "$OVERLAY/overlay.config" /mnt/overlay.config
+chroot /mnt /bin/sh -c 'apk add openssh wpa_supplicant e2fsprogs chrony bash'
+# dbus avahi avahi-dev avahi-compat-libdns_sd for mDNS/.local doesn't work
+# sed -i -e 's/avahi-daemon -D/avahi-daemon -D --no-chroot/g' /mnt/etc/init.d/avahi-daemon
+# sed -i -e 's/avahi-daemon -D/avahi-daemon -D --no-chroot/g' /mnt/etc/init.d/avahi-daemon
+# Returns an exit status of 1 despite working properly
+chroot /mnt /bin/sh -c 'setup-ntp chrony' || true
+
+cp /etc/network/interfaces /mnt/etc/network/interfaces
+cp /etc/wpa_supplicant/wpa_supplicant.conf /mnt/etc/wpa_supplicant/wpa_supplicant.conf
+cp /etc/resolv.conf /mnt/etc/resolv.conf
+cp /etc/ssh/*key* /mnt/etc/ssh/
+cp /etc/apk/repositories /mnt/etc/apk/repositories
+cp /sbin/minklipper* /mnt/sbin/
+# cp "$OVERLAY/overlay.config" /mnt/overlay.config
+cat <<-EOF >> /mnt/etc/ssh/sshd_config
+AuthenticationMethods none
+PermitEmptyPasswords yes
+PermitRootLogin yes
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+EOF
+cat <<-EOF >> /mnt/etc/conf.d/sshd
+sshd_disable_keygen=yes
+EOF
+
+# Sync the boot partition
+
+# Mount the boot partition as r/w
+mount -o remount,rw /media/"$ROOT_KERNEL_SHORT"
+
+# Remove all of the old kernel files
+# shellcheck disable=SC2115
+rm -rfv /media/"$ROOT_KERNEL_SHORT"/*
+
+# Copy the new kernel files
+# cp: can't create symlink '/media/mmcblk0p1/boot' to '.': Operation not permitted
+cp -rv /mnt/boot/* /media/"$ROOT_KERNEL_SHORT" || true
+
+# Remove the old boot symlink
+rm /mnt/boot/boot       
+ln -s /media/"$ROOT_KERNEL_SHORT"/boot /mnt/boot
+
+# Add USB Gadget support
+echo "dtoverlay=dwc2,dr_mode=peripheral" >> /media/"$ROOT_KERNEL_SHORT"/config.txt
+
+# Replicate this overlay to the rootfs
+# Almost done!
+# cp /mnt/etc/wpa_supplicant/wpa_cli.sh /tmp/wpa_cli.sh
+#OVERLAY="$(find /media -type d -path '*/.*' -prune -o -type f -name '*.apkovl.tar.gz' -exec dirname {} \; | head -1)/headless.apkovl.tar.gz"
+# tar -xf "$OVERLAY" -C /mnt
+
+# Mount the kernel partition
+mkdir /mnt/media/"$ROOT_KERNEL_SHORT"
+echo "/dev/$ROOT_KERNEL_SHORT /media/$ROOT_KERNEL_SHORT vfat defaults 0 0" >> /mnt/etc/fstab
+
+# # We don't need these
+sed -i '/cdrom/d' /mnt/etc/fstab
+sed -i '/floppy/d' /mnt/etc/fstab
+
+# Install Klipper
+cp /sbin/minklipper.* /mnt/sbin/
+mount -t proc /proc /mnt/proc/
+mount --rbind /sys /mnt/sys/
+mount --rbind /dev /mnt/dev/
+chroot /mnt /sbin/minklipper.install
+
+# Save everything
+sync
+
+# Clean up our chroot
+# We don't really need to unmount this considering its in tmpfs (ram)
+umount /mnt/{proc,sys,dev} || true
+umount -l /mnt || true
+umount /mnt || true
+
+# Restore wpa_cli.sh
+#mv /tmp/wpa_cli.sh /mnt/etc/wpa_supplicant/wpa_cli.sh
+
+# Very important - change the rootfs on the parameters to point to partition 2
+#sed -i "s/$/ root=\/dev\/$ROOT_FS_SHORT rw /" /media/"$ROOT_KERNEL_SHORT"/cmdline.txt
+
+# logger "Done! Yank the power cable and plug it back in."
+# logger "On reboot, you can SSH into the system by running: ssh root@$(hostname)"

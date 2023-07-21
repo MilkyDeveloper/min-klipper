@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# TODO: should we port this to Python?
+
+set -ex
+
+INSTALL_DIR="/root" # Where MinKlipper has been installed
+
+handle_error() {
+	PROMPT=$(whiptail --title "Error${EXCL_MARK}" \
+					  --menu "The MinKlipper installer has failed with an error on Line $1.\nHow would you like to proceed?" \
+					  12 88 2 \
+					  "🔄 Retry" " Rerun this script" \
+					  "🔧 Shell" " Exit this helper and drop into the shell" 3>&1 1>&2 2>&3)
+	if [[ "$PROMPT" == "🔄 Retry" ]]; then
+		bash "$(basename "$0")"
+	elif [[ "$PROMPT" == "🔧 Shell" ]]; then
+		echo "$(tput setaf 0)$(tput setab 7)  ℹ️ Return to the helper by running \"exit\"${EXCL_MARK} ℹ️  $(tput sgr0)"
+		bash
+		handle_error 'Returned from shell'
+	fi
+}
+
+# Exit on error or if the user cancels the whiptail prompt (esc)
+set -eEx
+trap 'handle_error $LINENO' ERR 
+
+# Bash parses an exclamation mark as an event designator
+EXCL_MARK=$(echo -e '\041')
+
+# Source file locations
+# shellcheck disable=SC1091
+. "$INSTALL_DIR"/minklipper.env
+
+# Install depencies
+echo "MinKlipper configurator started! Please wait for the dependencies to install."
+apk add newt eudev
+apk add newlib-arm-none-eabi==4.2.0.20211231-r4 --repository=http://dl-cdn.alpinelinux.org/alpine/v3.17/community
+
+# Starting Screen
+whiptail --title "MinKlipper" --yesno "Welcome to the MinKlipper configurator${EXCL_MARK}\n\nIf you get stuck or confused at any time, you can choose the \"No\" option to restart this script or enter a shell to follow a traditional tutorial." 22 78
+
+# Base Config loop
+while true; do
+	# Ask the user which config they want to use as a base
+	BASE_CONFIG=$(whiptail --inputbox "Input a base config that most closely matches your printer. You will be able to edit this later in Fluidd.\n• https://github.com/Klipper3d/klipper/tree/master/config (CTRL+Click)\n• Enter the filename (as shown below) instead of the full path" 22 78 printer-creality-ender3pro-2020.cfg --title "Printer Config Setup" 3>&1 1>&2 2>&3)
+
+	# Download the config, and if it fails, ask for a different config
+	if wget "https://raw.githubusercontent.com/Klipper3d/klipper/master/config/$BASE_CONFIG" -O "$DATA_DIR/config/printer.cfg"; then
+		break
+	else
+		whiptail --title "Config Download Failed" --yesno "Failed to fetch \"https://raw.githubusercontent.com/Klipper3d/klipper/master/config/$BASE_CONFIG\"\n\nTry again? (\"No\" will drop to a shell)" 22 78
+	fi
+done
+
+# Include the client config in the printer config
+echo -e "\n[include client.cfg]" >> "$DATA_DIR/config/printer.cfg"
+
+# Prepare the user for the next step
+whiptail --title "Image Configuration" --yesno "Go to https://github.com/Klipper3d/klipper/tree/master/config (CTRL+Click)\n• Select the file that most closely matches your device\n• Note down the following found in the first block of comments\n    ★ Chip type (e.g. \"STM\")\n    ★ Chip (e.g. \"STM32F103\")\n    ★ Bootloader size (e.g. \"28KiB bootloader\")\n    ★ Communication type (e.g. \"Serial (on USART1 PA10/PA9)\")\n• Follow the instructions in the wizard that proceeds\n• Save it by typing Q and S" 22 78
+
+# Launch the Klipper menuconfig
+cd "$KLIPPER_DIR"
+make menuconfig
+
+# Build the firmware
+# shellcheck disable=SC2046
+make -j$(nproc)
+
+# Start a Python server in the background and suppress all output
+python3 -m http.server -d "$INSTALL_DIR" 7999 &>/dev/null &
+# TODO: can we keep this server open safely?
+# To kill the server:
+# SERVER_PID=$!
+# kill "$SERVER_PID"
+
+# Instruct the user to flash the firmware
+IP=$(ifconfig | sed -En 's/127.0.0.1//;s/.*inet (addr:)?(([0-9]*\.){3}[0-9]*).*/\2/p')
+if PRE_DEVICES=$(ls /dev/serial/by-id/ 2>&1); then
+	if ! whiptail --title "Flashing Steps" --yesno "Firmware built successfully${EXCL_MARK}\n• Download http://${IP}:7999/klipper/out/klipper.bin (CTRL+Click)\n• Transfer this file to an SD Card or another medium compatible with your printer\n• Flash your printer\n• When the Klipper firmware is installed on your printer's board, continue\n\nHowever, a serial device has already been detected. This can mean either that your board can only be flashed from serial (e.g. the 8-bit Ender 3) or Klipper has been flashed previously.\n⭐/dev/serial/by-id/$PRE_DEVICES\n• Enter \"No\"\n• Run \"make flash FLASH_DEVICE=/dev/serial/by-id/$PRE_DEVICES\"\n• Return by running \"exit\"" 22 78; then
+		bash
+	fi
+else
+	whiptail --title "Flashing Steps" --yesno "Firmware built successfully${EXCL_MARK}\n• Download http://${IP}:7999/klipper/out/klipper.bin (CTRL+Click)\n• Transfer this file to an SD Card or another medium compatible with your printer\n• Flash your printer\n• When the Klipper firmware is installed on your printer's board, continue" 22 78
+fi
+
+# Serial Device loop
+while true; do
+	if ! ls /dev/serial/by-id/ 2>&1; then
+		# 3>&1 1>&2 2>&3 swaps stdout and stderr
+		PROMPT=$(whiptail --title "No Serial Devices Detected" \
+						  --menu "Confirm the connection between your printer and this device. Make sure the firmware has been flashed properly." \
+						  20 76 2 \
+						  "🔄 Retry" " Scans /dev/serial/by-id/ again" \
+						  "🔧 Shell" " Exit this helper and drop into the shell" 3>&1 1>&2 2>&3)
+		if [[ "$PROMPT" == "🔄 Retry" ]]; then
+			continue
+		elif [[ "$PROMPT" == "🔧 Shell" ]]; then
+			echo "$(tput setaf 0)$(tput setab 7)  ℹ️ Return to the helper by running \"exit\"${EXCL_MARK} ℹ️  $(tput sgr0)"
+			bash
+			continue
+		fi
+	else
+		# Create a list of devices
+		# see: https://askubuntu.com/a/438491/1188303
+		COUNTER=1
+		RADIOLIST=""
+		for i in /dev/serial/by-id/*; do
+			if [[ "$COUNTER" == 1 ]]; then
+				# shellcheck disable=SC2089
+				RADIOLIST="$RADIOLIST $i $COUNTER ON"
+			else
+				RADIOLIST="$RADIOLIST $i $COUNTER OFF"
+			fi
+			(( COUNTER++ )) || true
+		done
+		# shellcheck disable=SC2086
+		if PROMPT=$(whiptail --title "Serial Devices (Arrow Keys/TAB)" "Choose a serial device.\nIf you are not sure which one is correct, google around for your printer's value." 22 78 4 --radiolist $RADIOLIST 3>&1 1>&2 2>&3); then
+			# If the user selects a device, set the device path
+			SERIAL_PATH="$PROMPT"
+			break
+		else
+			continue
+		fi
+	fi
+done
+
+# Substitute the serial path into the config
+# TODO: Getting the absolute path and then getting the relative path is a roundabout way of doing this
+sed -i "s/serial: .*/serial: \/dev\/serial\/by-id\/$(basename "$SERIAL_PATH")/g" "$DATA_DIR/config/printer.cfg"
+
+# Add some necessary options for Fluidd
+/sbin/minklipper.amendconfig "$DATA_DIR/config/printer.cfg" "$DATA_DIR/gcodes"
+
+# All done!
+whiptail --title "Further Information" --msgbox "Klipper has been configured successfully.\n\nYou can access Fluidd, a dashboard for Klipper, on http://${IP}:8000\n\nIf you've enjoyed using MinKlipper, feel free to give it a star on Github.\n\nYou can safely exit from this serial connection." 22 78
